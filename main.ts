@@ -2,26 +2,45 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
+// Copies entry.png (next to this script) into $MAKEFUN_OUTPUT_DIR (default
+// /output), then re-reads the copy to confirm it is a PNG. Any failure prints
+// "Error: ..." to stderr and exits 1; a bad output file is removed.
+
+/** Source files outside 1..MAX_SOURCE_BYTES bytes are rejected. */
+const MAX_SOURCE_BYTES = 1048576; // 1 MiB
+
+/** The 8-byte magic number every PNG file starts with. */
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+/** Directory containing this script, so the source path doesn't depend on the cwd. */
 function scriptDir(): string {
-  // Resolve relative to this file, not the current working directory.
   return path.dirname(fileURLToPath(import.meta.url));
 }
 
+/** Print an error to stderr and exit with status 1. */
 function fail(message: string): never {
   console.error(`Error: ${message}`);
   process.exit(1);
 }
 
-const MAX_SOURCE_BYTES = 1048576; // 1 MiB
-
-const PNG_SIGNATURE =Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-
+/** Format bytes as space-separated uppercase hex, e.g. "89 50 4E 47". */
 function hex(buf: Buffer): string {
   return [...buf].map((b) => b.toString(16).toUpperCase().padStart(2, "0")).join(" ");
 }
 
-// Re-read the written file from disk and confirm it begins with the PNG
-// signature. On mismatch (or read error), remove the bad output and exit 1.
+/** Exit with an error unless 1 <= size <= MAX_SOURCE_BYTES. */
+function checkSourceSize(srcPath: string, size: number): void {
+  if (size === 0) fail(`source file is empty: ${srcPath} (0 bytes)`);
+  if (size > MAX_SOURCE_BYTES) {
+    fail(`source file is too large: ${srcPath} (${size} bytes, limit ${MAX_SOURCE_BYTES} bytes / 1 MiB)`);
+  }
+}
+
+/**
+ * Re-read the written file from disk (not the in-memory buffer) and confirm
+ * it starts with the PNG signature. On mismatch or read error, delete the
+ * output and exit 1.
+ */
 function verifyPngSignature(filePath: string): void {
   const header = Buffer.alloc(PNG_SIGNATURE.length);
   let bytesRead = 0;
@@ -40,19 +59,23 @@ function verifyPngSignature(filePath: string): void {
   const actual = header.subarray(0, bytesRead);
   if (readError === undefined && actual.equals(PNG_SIGNATURE)) return;
 
+  // Remove the bad output so nothing downstream picks it up.
+  let cleanup = "output file deleted";
   try {
     fs.rmSync(filePath, { force: true });
   } catch (err) {
-    console.error(`Warning: could not delete ${filePath}: ${(err as Error).message}`);
+    console.error(`Warning: cannot delete output file ${filePath}: ${(err as Error).message}`);
+    cleanup = "output file could not be deleted";
   }
 
   if (readError !== undefined) {
-    fail(`could not verify ${filePath}: ${readError}; output file deleted`);
+    fail(`cannot verify output file ${filePath}: ${readError}; ${cleanup}`);
   }
+  const got = bytesRead === 0 ? "(empty file)" : hex(actual);
+  const short = bytesRead < PNG_SIGNATURE.length ? ` (only ${bytesRead} bytes)` : "";
   fail(
-    `${filePath} is not a valid PNG: expected signature ${hex(PNG_SIGNATURE)}, ` +
-      `got ${bytesRead ? hex(actual) : "(empty file)"}` +
-      `${bytesRead < PNG_SIGNATURE.length ? ` (only ${bytesRead} bytes)` : ""}; output file deleted`,
+    `output file is not a valid PNG: ${filePath} ` +
+      `(expected signature ${hex(PNG_SIGNATURE)}, got ${got}${short}); ${cleanup}`,
   );
 }
 
@@ -61,24 +84,20 @@ function main(): void {
   const outDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
   const destPath = path.join(outDir, "entry.png");
 
+  // Note: fail() exits the process, so calls inside a try are not caught below.
   let data: Buffer;
   try {
+    // Check the size before reading so an oversized file is never loaded.
     const stat = fs.statSync(srcPath);
     if (!stat.isFile()) fail(`source is not a regular file: ${srcPath}`);
-    if (stat.size === 0) fail(`source file is empty (0 bytes): ${srcPath}`);
-    if (stat.size > MAX_SOURCE_BYTES) {
-      fail(`source file is too large: ${srcPath} is ${stat.size} bytes (limit ${MAX_SOURCE_BYTES} bytes / 1 MiB)`);
-    }
+    checkSourceSize(srcPath, stat.size);
     data = fs.readFileSync(srcPath);
-    // Re-check after reading in case the file changed between stat and read.
-    if (data.length === 0) fail(`source file is empty (0 bytes): ${srcPath}`);
-    if (data.length > MAX_SOURCE_BYTES) {
-      fail(`source file is too large: ${srcPath} is ${data.length} bytes (limit ${MAX_SOURCE_BYTES} bytes / 1 MiB)`);
-    }
+    // Check again: the file may have changed between stat and read.
+    checkSourceSize(srcPath, data.length);
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
-    if (e.code === "ENOENT") fail(`entry.png not found at ${srcPath}`);
-    fail(`cannot read ${srcPath}: ${e.message}`);
+    if (e.code === "ENOENT") fail(`source file not found: ${srcPath}`);
+    fail(`cannot read source file ${srcPath}: ${e.message}`);
   }
 
   try {
@@ -90,7 +109,7 @@ function main(): void {
   try {
     fs.writeFileSync(destPath, data);
   } catch (err) {
-    fail(`cannot write ${destPath}: ${(err as Error).message}`);
+    fail(`cannot write output file ${destPath}: ${(err as Error).message}`);
   }
 
   verifyPngSignature(destPath);
